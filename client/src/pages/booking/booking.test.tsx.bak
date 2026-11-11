@@ -1,0 +1,224 @@
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ProtectedRoute } from "../../routes/ProtectedRoute";
+import { RoleRoute } from "../../routes/RoleRoute";
+import { addDays, weekdayOf } from "../../lib/dates";
+import { TODAY } from "../../lib/booking";
+import { redirectTo } from "../../lib/redirect";
+import { jsonResponse, mockFetch, renderRoutes } from "../../test/helpers";
+import type { Handler } from "../../test/helpers";
+import type { User } from "../../types/api";
+import { BookingPage } from "./BookingPage";
+
+vi.mock("../../lib/redirect", () => ({ redirectTo: vi.fn() }));
+
+const patient: User = { id: "p1", name: "Priya Sharma", email: "priya@example.com", phone: "+911234567890", role: "PATIENT" };
+const treatments = [
+  { id: "t1", name: "Teeth Cleaning", slug: "teeth-cleaning", description: "Removes plaque.", durationMin: 45, priceMin: 150000, priceMax: 300000, bookingPrice: 150000, imageUrl: null, sortOrder: 1 },
+  { id: "t2", name: "Root Canal Treatment", slug: "root-canal", description: "Saves teeth.", durationMin: 90, priceMin: 600000, priceMax: 1200000, bookingPrice: 200000, imageUrl: null, sortOrder: 2 },
+];
+
+// A day with open slots: two days ahead, skipping Sunday (the clinic is closed on Sundays).
+function openDate() {
+  let d = addDays(TODAY, 2);
+  while (weekdayOf(d) === 0) d = addDays(d, 1);
+  return d;
+}
+const DATE = openDate();
+const SLOT_A = `${DATE}T04:30:00.000Z`; // 10:00 am India time
+const SLOT_B = `${DATE}T05:00:00.000Z`; // 10:30 am
+
+const routes = [
+  { path: "/login", element: <p>Login page</p> },
+  {
+    element: <ProtectedRoute />,
+    children: [{ element: <RoleRoute role="PATIENT" />, children: [{ path: "/book", element: <BookingPage /> }] }],
+  },
+];
+
+function api(overrides: Record<string, Handler> = {}) {
+  return mockFetch({
+    "GET /auth/me": () => jsonResponse({ user: patient }),
+    "GET /treatments": () => jsonResponse(treatments),
+    "GET /slots": () => jsonResponse({ slots: [{ start: SLOT_A }, { start: SLOT_B }] }),
+    "POST /appointments": () =>
+      jsonResponse({ appointment: { id: "apt_0123456789", status: "PENDING", holdExpiresAt: new Date(Date.now() + 10 * 60_000).toISOString() } }, 201),
+    "POST /payments/checkout": () => jsonResponse({ checkoutUrl: "https://checkout.stripe.com/c/pay/cs_test_123", sessionId: "cs_test_123" }, 201),
+    ...overrides,
+  });
+}
+
+const postedBody = (fn: ReturnType<typeof mockFetch>) => {
+  const call = fn.mock.calls.find(([url, init]) => String(url).includes("/appointments") && init?.method === "POST");
+  return call ? JSON.parse(String(call[1]?.body)) : null;
+};
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  vi.mocked(redirectTo).mockClear();
+  sessionStorage.clear();
+});
+
+describe("booking wizard", () => {
+  it("reserves a slot using the treatment and date from the URL", async () => {
+    const fetchMock = api();
+    renderRoutes(routes, `/book?treatment=teeth-cleaning&date=${DATE}`);
+
+    fireEvent.click(await screen.findByRole("button", { name: /10:00/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Reserve my slot" }));
+
+    expect(await screen.findByRole("heading", { name: "Your slot is held" })).toBeTruthy();
+    expect(await screen.findByRole("timer")).toBeTruthy();
+    expect(postedBody(fetchMock)).toEqual({ treatmentId: "t1", startTime: SLOT_A, consultationType: "IN_CLINIC", isNewPatient: false });
+  });
+
+  it("sends the chosen consultation type and new-patient flag", async () => {
+    const fetchMock = api();
+    renderRoutes(routes, `/book?treatment=root-canal&date=${DATE}`);
+
+    fireEvent.click(await screen.findByRole("button", { name: /10:30/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Video consultation/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /new patient/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Reserve my slot" }));
+
+    await screen.findByRole("heading", { name: "Your slot is held" });
+    expect(postedBody(fetchMock)).toEqual({ treatmentId: "t2", startTime: SLOT_B, consultationType: "VIDEO", isNewPatient: true });
+  });
+
+  it("cannot reserve until treatment, date and time are chosen", async () => {
+    api();
+    renderRoutes(routes, "/book");
+    const button = (await screen.findByRole("button", { name: "Reserve my slot" })) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(screen.getByText("a treatment, a date, a time")).toBeTruthy();
+  });
+
+  it("ignores past, invalid and Sunday dates in the URL", async () => {
+    api();
+    const sunday = (() => {
+      let d = addDays(TODAY, 1);
+      while (weekdayOf(d) !== 0) d = addDays(d, 1);
+      return d;
+    })();
+    for (const bad of ["2020-01-01", "2026-02-31", sunday]) {
+      const view = renderRoutes(routes, `/book?treatment=teeth-cleaning&date=${bad}`);
+      expect(await screen.findByText("a date, a time")).toBeTruthy();
+      view.unmount();
+    }
+  });
+
+  it("shows the server message and clears the choice when the slot was just taken", async () => {
+    api({ "POST /appointments": () => jsonResponse({ error: "That slot was just taken", code: "SLOT_TAKEN" }, 409) });
+    renderRoutes(routes, `/book?treatment=teeth-cleaning&date=${DATE}`);
+
+    fireEvent.click(await screen.findByRole("button", { name: /10:00/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Reserve my slot" }));
+
+    expect(await screen.findByText("That slot was just taken")).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("a time")).toBeTruthy()); // selection cleared, so a new time is needed
+  });
+
+  it("sends the visitor to log in when the session has expired", async () => {
+    api({ "POST /appointments": () => jsonResponse({ error: "Your session has expired. Please log in again", code: "UNAUTHENTICATED" }, 401) });
+    renderRoutes(routes, `/book?treatment=teeth-cleaning&date=${DATE}`);
+
+    fireEvent.click(await screen.findByRole("button", { name: /10:00/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Reserve my slot" }));
+
+    expect(await screen.findByText("Login page")).toBeTruthy();
+  });
+
+  it("tells the visitor when a day has no times", async () => {
+    api({ "GET /slots": () => jsonResponse({ slots: [] }) });
+    renderRoutes(routes, `/book?treatment=teeth-cleaning&date=${DATE}`);
+    expect(await screen.findByText(/No times are available on this day/)).toBeTruthy();
+  });
+});
+
+async function reserveSlot() {
+  fireEvent.click(await screen.findByRole("button", { name: /10:00/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Reserve my slot" }));
+  await screen.findByRole("heading", { name: "Your slot is held" });
+}
+
+const checkoutCalls = (fn: ReturnType<typeof mockFetch>) => fn.mock.calls.filter(([url, init]) => String(url).includes("/payments/checkout") && init?.method === "POST");
+
+describe("payment step", () => {
+  it("asks for a checkout session, remembers the booking and sends the visitor to Stripe", async () => {
+    const fetchMock = api();
+    renderRoutes(routes, `/book?treatment=teeth-cleaning&date=${DATE}`);
+    await reserveSlot();
+
+    fireEvent.click(screen.getByRole("button", { name: /Pay ₹1,500 securely/ }));
+
+    await waitFor(() => expect(redirectTo).toHaveBeenCalledWith("https://checkout.stripe.com/c/pay/cs_test_123"));
+    const calls = checkoutCalls(fetchMock);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(String(calls[0]?.[1]?.body))).toEqual({ appointmentId: "apt_0123456789" });
+
+    const saved = JSON.parse(sessionStorage.getItem("sc_pending_payment") ?? "{}");
+    expect(saved).toMatchObject({ appointmentId: "apt_0123456789", treatmentName: "Teeth Cleaning", slotStart: SLOT_A, bookingPrice: 150000 });
+  });
+
+  it("refuses to follow a payment link that is not Stripe's", async () => {
+    api({ "POST /payments/checkout": () => jsonResponse({ checkoutUrl: "https://evil.example/pay" }, 201) });
+    renderRoutes(routes, `/book?treatment=teeth-cleaning&date=${DATE}`);
+    await reserveSlot();
+
+    fireEvent.click(screen.getByRole("button", { name: /Pay ₹1,500 securely/ }));
+
+    expect(await screen.findByText(/unexpected payment link/)).toBeTruthy();
+    expect(redirectTo).not.toHaveBeenCalled();
+  });
+
+  it("shows the server message when the payment cannot be started", async () => {
+    api({ "POST /payments/checkout": () => jsonResponse({ error: "This appointment has already been paid", code: "ALREADY_PAID" }, 409) });
+    renderRoutes(routes, `/book?treatment=teeth-cleaning&date=${DATE}`);
+    await reserveSlot();
+
+    fireEvent.click(screen.getByRole("button", { name: /Pay ₹1,500 securely/ }));
+
+    expect(await screen.findByText(/already been paid/)).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Check payment status" })).toBeTruthy();
+  });
+});
+
+describe("returning from Stripe without paying", () => {
+  const pending = (minutes: number) => ({
+    appointmentId: "apt_0123456789",
+    treatmentName: "Teeth Cleaning",
+    slotStart: SLOT_A,
+    consultationType: "IN_CLINIC",
+    bookingPrice: 150000,
+    holdExpiresAt: new Date(Date.now() + minutes * 60_000).toISOString(),
+  });
+
+  it("offers to resume while the hold is still valid", async () => {
+    sessionStorage.setItem("sc_pending_payment", JSON.stringify(pending(5)));
+    const fetchMock = api();
+    renderRoutes(routes, `/book?treatment=teeth-cleaning&date=${DATE}&cancelled=1`);
+
+    expect(await screen.findByText("Payment was cancelled.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Resume payment" }));
+
+    await waitFor(() => expect(redirectTo).toHaveBeenCalledWith("https://checkout.stripe.com/c/pay/cs_test_123"));
+    expect(checkoutCalls(fetchMock)).toHaveLength(1);
+  });
+
+  it("says the hold expired instead of offering a dead button", async () => {
+    sessionStorage.setItem("sc_pending_payment", JSON.stringify(pending(-1)));
+    api();
+    renderRoutes(routes, `/book?treatment=teeth-cleaning&date=${DATE}&cancelled=1`);
+
+    expect(await screen.findByText(/Your hold has expired/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Resume payment" })).toBeNull();
+  });
+
+  it("can be dismissed", async () => {
+    api();
+    renderRoutes(routes, `/book?treatment=teeth-cleaning&date=${DATE}&cancelled=1`);
+    fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(screen.queryByText("Payment was cancelled.")).toBeNull());
+  });
+});

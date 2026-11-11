@@ -1,0 +1,127 @@
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { redirectTo } from "../../lib/redirect";
+import { ProtectedRoute } from "../../routes/ProtectedRoute";
+import { RoleRoute } from "../../routes/RoleRoute";
+import { jsonResponse, mockFetch, renderRoutes } from "../../test/helpers";
+import type { Handler } from "../../test/helpers";
+import type { User } from "../../types/api";
+import { PaymentSuccessPage } from "./PaymentSuccessPage";
+
+vi.mock("../../lib/redirect", () => ({ redirectTo: vi.fn() }));
+
+const patient: User = { id: "p1", name: "Priya Sharma", email: "priya@example.com", phone: null, role: "PATIENT" };
+
+const routes = [
+  { path: "/login", element: <p>Login page</p> },
+  {
+    element: <ProtectedRoute />,
+    children: [
+      {
+        element: <RoleRoute role="PATIENT" />,
+        children: [
+          { path: "/book/success", element: <PaymentSuccessPage /> },
+          { path: "/book", element: <p>Booking page</p> },
+          { path: "/patient", element: <p>Patient area</p> },
+        ],
+      },
+    ],
+  },
+];
+
+const paid = { appointmentStatus: "CONFIRMED", payment: { status: "PAID", amount: 150000 }, invoice: { number: "INV-2026-0001" } };
+const waiting = { appointmentStatus: "PENDING", payment: { status: "PENDING" }, invoice: null };
+
+function api(status: Handler, extra: Record<string, Handler> = {}) {
+  return mockFetch({
+    "GET /auth/me": () => jsonResponse({ user: patient }),
+    "GET /payments/appointments/apt_1": status,
+    "POST /payments/checkout": () => jsonResponse({ checkoutUrl: "https://checkout.stripe.com/c/pay/cs_test_retry" }, 200),
+    ...extra,
+  });
+}
+
+const savedBooking = {
+  appointmentId: "apt_1",
+  treatmentName: "Teeth Cleaning",
+  slotStart: "2026-11-03T04:30:00.000Z",
+  consultationType: "IN_CLINIC",
+  bookingPrice: 150000,
+  holdExpiresAt: null,
+};
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  vi.mocked(redirectTo).mockClear();
+  sessionStorage.clear();
+});
+
+describe("payment success page", () => {
+  it("confirms a paid appointment with amount, invoice and booking details", async () => {
+    sessionStorage.setItem("sc_pending_payment", JSON.stringify(savedBooking));
+    api(() => jsonResponse(paid));
+    renderRoutes(routes, "/book/success?appointmentId=apt_1&session_id=cs_test_123");
+
+    expect(await screen.findByRole("heading", { name: "Your appointment is confirmed" })).toBeTruthy();
+    expect(screen.getByText("INV-2026-0001")).toBeTruthy();
+    expect(screen.getByText("₹1,500")).toBeTruthy();
+    expect(screen.getByText("Teeth Cleaning")).toBeTruthy();
+    await waitFor(() => expect(sessionStorage.getItem("sc_pending_payment")).toBeNull()); // cleaned up after success
+  });
+
+  it("keeps checking until the webhook has confirmed the payment", { timeout: 10_000 }, async () => {
+    let calls = 0;
+    const fetchMock = api(() => jsonResponse(++calls < 2 ? waiting : paid));
+    renderRoutes(routes, "/book/success?appointmentId=apt_1");
+
+    expect(await screen.findByRole("heading", { name: "Confirming your payment" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Your appointment is confirmed" }, { timeout: 6000 })).toBeTruthy();
+    expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/payments/appointments/apt_1")).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("uses the remembered booking when the return link has only a session id", async () => {
+    sessionStorage.setItem("sc_pending_payment", JSON.stringify(savedBooking));
+    api(() => jsonResponse(paid));
+    renderRoutes(routes, "/book/success?session_id=cs_test_123");
+    expect(await screen.findByRole("heading", { name: "Your appointment is confirmed" })).toBeTruthy();
+  });
+
+  it("tells the patient when the payment was refunded because the slot was taken", async () => {
+    api(() => jsonResponse({ appointmentStatus: "CANCELLED", payment: { status: "REFUNDED" }, invoice: null }));
+    renderRoutes(routes, "/book/success?appointmentId=apt_1");
+    expect(await screen.findByRole("heading", { name: "That time was just taken" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Choose another time" })).toBeTruthy();
+  });
+
+  it("offers a retry when the payment failed", async () => {
+    sessionStorage.setItem("sc_pending_payment", JSON.stringify(savedBooking));
+    const fetchMock = api(() => jsonResponse({ appointmentStatus: "PENDING", payment: { status: "FAILED" }, invoice: null }));
+    renderRoutes(routes, "/book/success?appointmentId=apt_1");
+
+    expect(await screen.findByRole("heading", { name: "Payment not completed" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Try payment again" }));
+
+    await waitFor(() => expect(redirectTo).toHaveBeenCalledWith("https://checkout.stripe.com/c/pay/cs_test_retry"));
+    const post = fetchMock.mock.calls.find(([u, init]) => String(u).includes("/payments/checkout") && init?.method === "POST");
+    expect(JSON.parse(String(post?.[1]?.body))).toEqual({ appointmentId: "apt_1" });
+  });
+
+  it("explains when there is no booking to check", async () => {
+    api(() => jsonResponse(paid));
+    renderRoutes(routes, "/book/success");
+    expect(await screen.findByRole("heading", { name: "Nothing to confirm" })).toBeTruthy();
+  });
+
+  it("says so when the booking is not found", async () => {
+    api(() => jsonResponse({ error: "Appointment not found", code: "NOT_FOUND" }, 404));
+    renderRoutes(routes, "/book/success?appointmentId=apt_1");
+    expect(await screen.findByRole("heading", { name: "Booking not found" })).toBeTruthy();
+  });
+
+  it("sends a logged-out visitor to log in when the session expired", async () => {
+    api(() => jsonResponse({ error: "Please log in", code: "UNAUTHENTICATED" }, 401));
+    renderRoutes(routes, "/book/success?appointmentId=apt_1");
+    expect(await screen.findByText("Login page")).toBeTruthy();
+  });
+});

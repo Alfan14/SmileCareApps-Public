@@ -1,0 +1,25 @@
+# Dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+coverage/
+*.tsbuildinfo
+
+# Secrets: only *.example files may be committed
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local tooling
+repomix-output.xml
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.log
+npm-debug.log*
+
+# Prisma generated client (if you ever change its output path)
+server/src/generated/

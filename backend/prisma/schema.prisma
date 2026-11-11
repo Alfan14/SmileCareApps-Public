@@ -1,0 +1,265 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  PATIENT
+  OWNER
+}
+
+enum ConsultationType {
+  IN_CLINIC
+  VIDEO
+}
+
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUND_PENDING
+  REFUND_FAILED
+  REFUNDED
+}
+
+enum MessageSender {
+  PATIENT
+  CLINIC
+}
+
+model User {
+  id           String    @id @default(cuid())
+  name         String
+  email        String    @unique
+  phone        String?
+  passwordHash String
+  role         Role      @default(PATIENT)
+  dob          DateTime?
+  address      String?
+  createdAt    DateTime  @default(now())
+
+  appointments  Appointment[]
+  records       TreatmentRecord[]
+  prescriptions Prescription[]
+  messages      Message[]
+  reviews       Review[]
+  notifications Notification[]
+}
+
+model Treatment {
+  id           String  @id @default(cuid())
+  name         String
+  slug         String  @unique
+  description  String
+  durationMin  Int
+  priceMin     Int // paise
+  priceMax     Int // paise
+  bookingPrice Int // paise, charged online
+  imageUrl     String?
+  active       Boolean @default(true)
+  sortOrder    Int     @default(0)
+
+  appointments Appointment[]
+}
+
+model Appointment {
+  id               String            @id @default(cuid())
+  patientId        String
+  treatmentId      String
+  startTime        DateTime
+  endTime          DateTime
+  consultationType ConsultationType  @default(IN_CLINIC)
+  status           AppointmentStatus @default(PENDING)
+  meetLink         String?
+  notes            String?
+  isNewPatient     Boolean           @default(false)
+  holdExpiresAt    DateTime?
+  cancelledAt      DateTime?
+  cancelReason     String?
+  cancelledBy      Role?
+  rescheduleCount  Int               @default(0)
+  createdAt        DateTime          @default(now())
+
+  patient   User             @relation(fields: [patientId], references: [id])
+  treatment Treatment        @relation(fields: [treatmentId], references: [id])
+  payment   Payment?
+  record    TreatmentRecord?
+  review    Review?
+
+  @@index([startTime, status])
+  @@index([patientId, startTime])
+}
+
+model Payment {
+  id                    String        @id @default(cuid())
+  appointmentId         String        @unique
+  amount                Int // paise
+  currency              String        @default("inr")
+  method                String?
+  status                PaymentStatus @default(PENDING)
+  stripeSessionId       String        @unique
+  stripePaymentIntentId String?
+  paidAt                DateTime?
+  failureReason         String?
+  stripeRefundId        String?
+  refundedAt            DateTime?
+  createdAt             DateTime      @default(now())
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id])
+  invoice     Invoice?
+}
+
+model Invoice {
+  id          String    @id @default(cuid())
+  paymentId   String    @unique
+  number      String    @unique // e.g. INV-2026-0001
+  issuedAt    DateTime  @default(now())
+  emailSentAt DateTime?
+
+  payment Payment @relation(fields: [paymentId], references: [id])
+}
+
+model StripeEvent {
+  id          String   @id // Stripe event id, for idempotency
+  type        String
+  processedAt DateTime @default(now())
+}
+
+model TreatmentRecord {
+  id            String   @id @default(cuid())
+  patientId     String
+  appointmentId String?  @unique
+  toothNo       String?
+  title         String
+  summary       String
+  date          DateTime @default(now())
+
+  patient       User           @relation(fields: [patientId], references: [id])
+  appointment   Appointment?   @relation(fields: [appointmentId], references: [id])
+  prescriptions Prescription[]
+
+  @@index([patientId, date])
+}
+
+model Prescription {
+  id           String   @id @default(cuid())
+  patientId    String
+  recordId     String?
+  medicine     String
+  instructions String
+  date         DateTime @default(now())
+
+  patient User             @relation(fields: [patientId], references: [id])
+  record  TreatmentRecord? @relation(fields: [recordId], references: [id])
+}
+
+model WorkingHours {
+  id          String  @id @default(cuid())
+  dayOfWeek   Int     @unique // 0 = Sunday ... 6 = Saturday
+  startTime   String // "09:00"
+  endTime     String // "19:00"
+  breakStart  String? // "13:00"
+  breakEnd    String? // "14:00"
+  slotMinutes Int     @default(30)
+  isOff       Boolean @default(false)
+}
+
+model BlockedDate {
+  id     String   @id @default(cuid())
+  date   DateTime @unique
+  reason String?
+}
+
+model Message {
+  id            String        @id @default(cuid())
+  patientId     String
+  sender        MessageSender
+  body          String
+  attachmentUrl String?
+  readAt        DateTime?
+  createdAt     DateTime      @default(now())
+
+  patient User @relation(fields: [patientId], references: [id])
+
+  @@index([patientId, createdAt])
+}
+
+model Review {
+  id            String   @id @default(cuid())
+  patientId     String?
+  appointmentId String?  @unique // one review per completed appointment
+  authorName String
+  rating     Int
+  comment    String
+  approved   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  patient     User?        @relation(fields: [patientId], references: [id])
+  appointment Appointment? @relation(fields: [appointmentId], references: [id])
+}
+
+model Faq {
+  id        String @id @default(cuid())
+  question  String
+  answer    String
+  category  String @default("general")
+  sortOrder Int    @default(0)
+}
+
+model ContactMessage {
+  id        String   @id @default(cuid())
+  name      String
+  email     String
+  phone     String?
+  body      String
+  createdAt DateTime @default(now())
+}
+
+model AiSettings {
+  id           Int      @id @default(1)
+  provider     String   @default("mock") // gemini | openai | mock
+  model        String?
+  encryptedKey String?
+  iv           String?
+  authTag      String?
+  keyLast4     String?
+  enabled      Boolean  @default(true)
+  updatedAt    DateTime @updatedAt
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  type      String
+  text      String
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model AiUsage {
+  id           String   @id @default(cuid())
+  requestId    String   @unique
+  model        String
+  status       String
+  inputTokens  Int      @default(0)
+  outputTokens Int      @default(0)
+  costMicros   Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([status, createdAt])
+}

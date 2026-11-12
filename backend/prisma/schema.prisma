@@ -83,6 +83,9 @@ model Appointment {
   consultationType ConsultationType  @default(IN_CLINIC)
   status           AppointmentStatus @default(PENDING)
   meetLink         String?
+  calendarEventId  String?           @unique
+  meetCreatedAt    DateTime?
+  meetStatus       String            @default("NOT_REQUIRED")
   notes            String?
   isNewPatient     Boolean           @default(false)
   holdExpiresAt    DateTime?

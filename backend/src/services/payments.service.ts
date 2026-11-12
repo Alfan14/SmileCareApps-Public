@@ -9,6 +9,7 @@ import {
   sendDentistNotification,
   sendPatientNotification,
 } from "./email.service";
+import { ensureMeetLinkForAppointment } from "./meet.service";
 
 export const stripe: Stripe = new Stripe(env.STRIPE_SECRET_KEY ?? "sk_test_mock");
 
@@ -733,16 +734,13 @@ async function onCompleted(
     return;
   }
 
-  const meetLink =
-    appt.consultationType === "VIDEO" ? (env.MEET_LINK ?? null) : null;
-
   const invoice = await prisma.$transaction(async (tx) => {
     await tx.appointment.update({
       where: { id: appointmentId },
       data: {
         status: "CONFIRMED",
         holdExpiresAt: null,
-        meetLink,
+        meetLink: null,
         ...(isRecoverableHoldCancellation
           ? { cancelledAt: null, cancelReason: null }
           : {}),
@@ -773,6 +771,12 @@ async function onCompleted(
       },
     });
   });
+
+  // Calendar provisioning runs after the payment/appointment transaction commits. If Google
+  // is temporarily unavailable, the confirmed payment remains intact and webhook replay retries it.
+  const meetLink = appt.consultationType === "VIDEO"
+    ? await ensureMeetLinkForAppointment(appointmentId)
+    : null;
 
   await notify(
     sendDentistNotification(
@@ -822,6 +826,9 @@ async function sendConfirmationIfNeeded(appointmentId: string): Promise<void> {
     },
   });
 
+  const meetLink = appt?.consultationType === "VIDEO"
+    ? await ensureMeetLinkForAppointment(appointmentId)
+    : null;
   const payment = appt?.payment;
   const invoice = payment?.invoice;
 
@@ -845,7 +852,7 @@ async function sendConfirmationIfNeeded(appointmentId: string): Promise<void> {
       timeZone: env.CLINIC_TIMEZONE,
     }).format(appt.startTime),
     location: env.CLINIC_ADDRESS,
-    meetLink: appt.meetLink,
+    meetLink: meetLink ?? appt.meetLink,
     invoiceNo: invoice.number,
   });
 

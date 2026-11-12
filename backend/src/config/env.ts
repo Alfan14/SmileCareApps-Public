@@ -39,6 +39,13 @@ const schema = z.object({
   CLINIC_TIMEZONE: z.string().default("Asia/Kolkata").refine((value) => {
     try { new Intl.DateTimeFormat("en-US", { timeZone: value }); return true; } catch { return false; }
   }, "CLINIC_TIMEZONE must be a valid IANA timezone"),
+  // Set true in Render only after the Google OAuth refresh token has been generated.
+  GOOGLE_MEET_ENABLED: bool,
+  GOOGLE_CLIENT_ID: z.string().optional(),
+  GOOGLE_CLIENT_SECRET: z.string().optional(),
+  GOOGLE_REFRESH_TOKEN: z.string().optional(),
+  GOOGLE_CALENDAR_ID: z.string().default("primary"),
+  // Legacy static link is retained only as an explicit fallback when Google Meet is disabled.
   MEET_LINK: z.string().optional(),
 });
 
